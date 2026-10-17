@@ -9,6 +9,8 @@ import threading
 import time
 from ctypes import wintypes
 
+from clipboard_sync import ClipboardMonitor
+
 PORT = 24800
 
 WM_MOUSEMOVE = 0x0200
@@ -223,6 +225,7 @@ class FlowSwitchController:
         self.shutdown_event = threading.Event()
         self.connection_dead = False
         self.last_pong = time.monotonic()
+        self.clipboard_monitor = ClipboardMonitor(self.send, self.shutdown_event)
 
         self.active = False
         self.last_toggle = 0.0
@@ -613,7 +616,8 @@ class FlowSwitchController:
                     self.set_active(False)
                 elif kind == "pong":
                     self.last_pong = time.monotonic()
-                    print("[FlowSwitch heartbeat/debug] Pong received from Mac.", flush=True)
+                elif kind == "clipboard_text":
+                    self.clipboard_monitor.apply_remote_text(message.get("text"))
         except (OSError, ValueError) as exc:
             if not self.shutdown_event.is_set():
                 self.connection_lost(f"receiver read failed: {exc}")
@@ -686,6 +690,11 @@ class FlowSwitchController:
             name="FlowSwitchReceiverReader",
         ).start()
         threading.Thread(
+            target=self.clipboard_monitor.run,
+            daemon=True,
+            name="FlowSwitchClipboardMonitor",
+        ).start()
+        threading.Thread(
             target=self._heartbeat_loop,
             daemon=True,
             name="FlowSwitchHeartbeat",
@@ -731,7 +740,14 @@ class FlowSwitchController:
         self.report_status(f"Fallback toggle: {HOTKEY}. Move to the Mac's left edge to return.")
 
         msg = wintypes.MSG()
-        signal.signal(signal.SIGINT, self._sigint_handler)
+        # The GUI runs this controller on a worker thread. Python only allows
+        # signal.signal() from the main interpreter thread; calling it here in
+        # the GUI worker raises ValueError and immediately tears down an otherwise
+        # healthy socket after the heartbeat exchange has begun. The GUI uses
+        # request_stop()/PostThreadMessageW instead. Keep the SIGINT handler for
+        # the command-line mode, where run() executes on the main thread.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._sigint_handler)
         if self.stop_requested.is_set() or self.connection_dead:
             user32.PostThreadMessageW(self.message_thread_id, WM_QUIT, 0, 0)
 
