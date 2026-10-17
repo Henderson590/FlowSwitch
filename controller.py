@@ -12,6 +12,7 @@ from ctypes import wintypes
 PORT = 24800
 
 WM_MOUSEMOVE = 0x0200
+WM_QUIT = 0x0012
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
 WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
@@ -125,6 +126,13 @@ user32.ShowCursor.restype = ctypes.c_int
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.PostQuitMessage.restype = None
 
+user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
 
 VK_NAMES = {
     0x08: "Key.backspace",
@@ -199,10 +207,13 @@ def signed_word(value):
 
 
 class FlowSwitchController:
-    def __init__(self, host, port, token):
+    def __init__(self, host, port, token, status_callback=None):
         self.host = host
         self.port = port
         self.token = token
+        self.status_callback = status_callback
+        self.message_thread_id = None
+        self.stop_requested = threading.Event()
 
         self.sock = None
         self.sock_file = None
@@ -237,6 +248,21 @@ class FlowSwitchController:
         # Keep callback objects alive for as long as the hooks exist.
         self.mouse_callback = HOOKPROC(self._mouse_hook_proc)
         self.keyboard_callback = HOOKPROC(self._keyboard_hook_proc)
+
+    def report_status(self, message):
+        print(message)
+        if self.status_callback is not None:
+            try:
+                self.status_callback(message)
+            except Exception:
+                pass
+
+    def request_stop(self):
+        """Ask the hook/message-loop thread to shut down cleanly."""
+        self.stop_requested.set()
+        thread_id = self.message_thread_id
+        if thread_id:
+            user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
 
     def send(self, payload):
         """Queue a protocol message quickly; hook callbacks never block on TCP."""
@@ -288,7 +314,10 @@ class FlowSwitchController:
         # This transition is deliberately local-only. Once the connection is
         # gone, do not try to send releases over a dead socket.
         self.force_local_control(send_releases=False)
-        print(f"\nFlowSwitch connection lost ({reason}). Windows input restored.")
+        self.stop_requested.set()
+        self.report_status(f"Connection lost: {reason}. Windows input restored.")
+        if self.message_thread_id:
+            user32.PostThreadMessageW(self.message_thread_id, WM_QUIT, 0, 0)
 
         if sock is not None:
             try:
@@ -313,7 +342,7 @@ class FlowSwitchController:
             self.send_release_all()
 
         if was_active:
-            print("Remote input OFF — control returned to Windows.")
+            self.report_status("Disconnected from Mac; control returned to Windows.")
 
     def hide_cursor(self):
         if not self.cursor_hidden:
@@ -358,10 +387,10 @@ class FlowSwitchController:
             if not self.send({"type": "enter"}):
                 self.force_local_control(send_releases=False)
                 return
-            print("Remote input ON — move to the Mac's left edge to return.")
+            self.report_status("Connected — move to the Mac edge to switch. Ctrl+Alt+F12 toggles control.")
         else:
             self.send_release_all()
-            print("Remote input OFF — control returned to Windows.")
+            self.report_status("Disconnected from Mac; control returned to Windows.")
 
     def send_release_all(self):
         with self.state_lock:
@@ -584,6 +613,7 @@ class FlowSwitchController:
                     self.set_active(False)
                 elif kind == "pong":
                     self.last_pong = time.monotonic()
+                    print("[FlowSwitch heartbeat/debug] Pong received from Mac.", flush=True)
         except (OSError, ValueError) as exc:
             if not self.shutdown_event.is_set():
                 self.connection_lost(f"receiver read failed: {exc}")
@@ -600,8 +630,9 @@ class FlowSwitchController:
         while not self.shutdown_event.wait(HEARTBEAT_INTERVAL):
             if self.connection_dead:
                 return
-            if time.monotonic() - self.last_pong > HEARTBEAT_TIMEOUT:
-                self.connection_lost("heartbeat timed out")
+            pong_age = time.monotonic() - self.last_pong
+            if pong_age > HEARTBEAT_TIMEOUT:
+                self.connection_lost(f"heartbeat timed out (last pong {pong_age:.2f}s ago)")
                 return
             if not self.send({"type": "ping"}):
                 return
@@ -613,7 +644,8 @@ class FlowSwitchController:
         user32.PostQuitMessage(0)
 
     def run(self):
-        print(f"Connecting to {self.host}:{self.port} ...")
+        self.message_thread_id = kernel32.GetCurrentThreadId()
+        self.report_status(f"Connecting to {self.host}:{self.port} ...")
 
         self.sock = socket.create_connection(
             (self.host, self.port), timeout=8
@@ -695,12 +727,13 @@ class FlowSwitchController:
                 + ctypes.FormatError(error).strip(),
             )
 
-        print("Connected.")
-        print("Move the cursor to the RIGHT edge to enter the Mac.")
-        print(f"Fallback toggle: {HOTKEY}. Move to the Mac's left edge to return.")
+        self.report_status("Connected. Move the cursor to the RIGHT edge to enter the Mac.")
+        self.report_status(f"Fallback toggle: {HOTKEY}. Move to the Mac's left edge to return.")
 
         msg = wintypes.MSG()
         signal.signal(signal.SIGINT, self._sigint_handler)
+        if self.stop_requested.is_set() or self.connection_dead:
+            user32.PostThreadMessageW(self.message_thread_id, WM_QUIT, 0, 0)
 
         try:
             while True:
@@ -734,6 +767,7 @@ class FlowSwitchController:
                 self.keyboard_hook = None
 
             self.show_cursor()
+            self.message_thread_id = None
 
             with self.sock_lock:
                 sock = self.sock
@@ -769,9 +803,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        FlowSwitchController(
-            args.host, args.port, args.token
-        ).run()
+        FlowSwitchController(args.host, args.port, args.token).run()
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(f"FlowSwitch: {exc}")
 
