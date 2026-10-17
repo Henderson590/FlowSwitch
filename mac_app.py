@@ -1,11 +1,12 @@
 """FlowSwitch Mac GUI receiver. Run on macOS with Python 3.11+, tkinter and pynput."""
 import queue
+from pathlib import Path
 import socket
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from receiver import PORT, run_receiver
+from receiver import PORT, run_receiver, send_files_to_controller
 
 
 def local_ip():
@@ -29,8 +30,8 @@ class MacApp:
     def __init__(self, root):
         self.root = root
         self.root.title("FlowSwitch — Mac Receiver")
-        self.root.geometry("440x320")
-        self.root.minsize(420, 300)
+        self.root.geometry("480x500")
+        self.root.minsize(440, 460)
         self.messages = queue.Queue()
         self.stop_event = None
         self.worker = None
@@ -53,8 +54,16 @@ class MacApp:
         self.start_button.pack(fill="x", pady=(16, 0))
         self.stop_button = ttk.Button(frame, text="Stop Receiver", command=self.stop, state="disabled")
         self.stop_button.pack(fill="x", pady=(7, 0))
+        self.download_dir = tk.StringVar(value=str(Path.home() / "Downloads"))
+        ttk.Label(frame, text="Incoming files save to").pack(anchor="w", pady=(14, 4))
+        folder_row = ttk.Frame(frame)
+        folder_row.pack(fill="x")
+        ttk.Entry(folder_row, textvariable=self.download_dir).pack(side="left", fill="x", expand=True)
+        ttk.Button(folder_row, text="Browse…", command=self.choose_download_dir).pack(side="left", padx=(8, 0))
+        ttk.Button(frame, text="Send File(s)…", command=self.send_files).pack(fill="x", pady=(12, 0))
+
         self.status = tk.StringVar(value="Receiver stopped")
-        ttk.Label(frame, textvariable=self.status, wraplength=390).pack(anchor="w", pady=(12, 0))
+        ttk.Label(frame, textvariable=self.status, wraplength=420).pack(anchor="w", pady=(12, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(150, self.poll_messages)
@@ -72,19 +81,32 @@ class MacApp:
         self.status.set("Starting receiver…")
         self.worker = threading.Thread(
             target=self.run_server,
-            args=(token, self.stop_event),
+            args=(token, self.stop_event, self.download_dir.get().strip()),
             daemon=True,
         )
         self.worker.start()
 
-    def run_server(self, token, stop_event):
+    def run_server(self, token, stop_event, download_dir):
         try:
             size = (self.root.winfo_screenwidth(), self.root.winfo_screenheight())
-            run_receiver(token=token, stop_event=stop_event, status_callback=self.messages.put, screen_size=size)
+            run_receiver(token=token, stop_event=stop_event, status_callback=self.messages.put,
+                         screen_size=size, download_dir=download_dir)
         except Exception as exc:
             self.messages.put(f"Receiver error: {exc}")
         finally:
             self.messages.put("Receiver stopped")
+
+    def choose_download_dir(self):
+        folder = filedialog.askdirectory(title="Choose where incoming files are saved", parent=self.root)
+        if folder:
+            self.download_dir.set(folder)
+
+    def send_files(self):
+        paths = filedialog.askopenfilenames(title="Choose files to send", parent=self.root)
+        if not paths:
+            return
+        if not send_files_to_controller(paths):
+            messagebox.showwarning("Not connected", "Start the receiver and connect from Windows before sending files.", parent=self.root)
 
     def stop(self):
         if self.stop_event:
